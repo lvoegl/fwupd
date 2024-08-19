@@ -22,6 +22,7 @@ shared_module('fu_plugin_modem_manager',
     'fu-mbim-qdu-updater.c',
     'fu-firehose-updater.c',
     'fu-sahara-loader.c',
+    'fu-cinterion-fdl-updater.c',
     'fu-mm-utils.c'
   ],
   include_directories: plugin_incdirs,

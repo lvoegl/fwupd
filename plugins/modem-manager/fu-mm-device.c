@@ -11,6 +11,7 @@
 #include <glib/gstdio.h>
 #include <string.h>
 
+#include "fu-cinterion-fdl-updater.h"
 #include "fu-firehose-updater.h"
 #include "fu-mbim-qdu-updater.h"
 #include "fu-mm-device.h"
@@ -80,6 +81,9 @@ struct _FuMmDevice {
 	/* for sahara */
 	FuUsbDevice *usb_device;
 
+	/* cinterion-fdl update handling */
+	FuCinterionFdlUpdater *cinterion_fdl_updater;
+
 	/* firmware path */
 	gchar *firmware_path;
 	gchar *restore_firmware_path;
@@ -129,6 +133,9 @@ validate_firmware_update_method(MMModemFirmwareUpdateMethod methods, GError **er
 		MM_MODEM_FIRMWARE_UPDATE_METHOD_FIREHOSE,
 #if MM_CHECK_VERSION(1, 19, 1)
 		MM_MODEM_FIRMWARE_UPDATE_METHOD_FIREHOSE | MM_MODEM_FIRMWARE_UPDATE_METHOD_SAHARA,
+#endif
+#if MM_CHECK_VERSION(1, 23, 0)
+		MM_MODEM_FIRMWARE_UPDATE_METHOD_CINTERION_FDL,
 #endif
 	};
 	g_autofree gchar *methods_str = NULL;
@@ -249,6 +256,15 @@ fu_mm_device_probe_default(FuDevice *device, GError **error)
 				    FWUPD_ERROR_NOT_SUPPORTED,
 				    "failed to get port information");
 		return FALSE;
+	}
+	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_CINTERION_FDL) {
+		for (guint i = 0; i < n_ports; i++) {
+			if (ports[i].type == MM_MODEM_PORT_TYPE_AT) {
+				self->port_at = g_strdup_printf("/dev/%s", ports[i].name);
+				break;
+			}
+		}
+		fu_device_add_protocol(device, "com.cinterion.fdl");
 	}
 	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_FASTBOOT) {
 		for (guint i = 0; i < n_ports; i++) {
@@ -512,6 +528,15 @@ fu_mm_device_probe_udev(FuDevice *device, GError **error)
 
 	/* an at port is required for fastboot */
 	if ((self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_FASTBOOT) &&
+	    (self->port_at == NULL)) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_NOT_SUPPORTED,
+				    "failed to find AT port");
+		return FALSE;
+	}
+
+	if ((self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_CINTERION_FDL) &&
 	    (self->port_at == NULL)) {
 		g_set_error_literal(error,
 				    FWUPD_ERROR,
@@ -815,6 +840,59 @@ fu_mm_device_io_close(FuMmDevice *self, GError **error)
 }
 
 static gboolean
+fu_mm_device_cinterion_fdl_open(FuMmDevice *self, GError **error)
+{
+	self->cinterion_fdl_updater = fu_cinterion_fdl_updater_new(self->port_at);
+	return fu_cinterion_fdl_updater_open(self->cinterion_fdl_updater, error);
+}
+
+static gboolean
+fu_mm_device_cinterion_fdl_close(FuMmDevice *self, GError **error)
+{
+	g_autoptr(FuCinterionFdlUpdater) updater = NULL;
+
+	updater = g_steal_pointer(&self->cinterion_fdl_updater);
+	return fu_cinterion_fdl_updater_close(updater, error);
+}
+
+static gboolean
+fu_mm_device_detach_fdl(FuDevice *device, FuProgress *progress, GError **error)
+{
+	FuMmDevice *self = FU_MM_DEVICE(device);
+	g_autoptr(FuDeviceLocker) locker = NULL;
+
+	locker = fu_device_locker_new_full(device,
+					   (FuDeviceLockerFunc)fu_mm_device_io_open,
+					   (FuDeviceLockerFunc)fu_mm_device_io_close,
+					   error);
+
+	if (locker == NULL)
+		return FALSE;
+	if (!fu_mm_device_at_cmd(self, "AT", TRUE, error))
+		return FALSE;
+	if (!fu_mm_device_at_cmd(self, "AT^SFDL", TRUE, error)) {
+		g_prefix_error(error, "enabling firmware download mode not supported: ");
+		return FALSE;
+	}
+
+	if (!fu_device_locker_close(locker, error)) {
+		return FALSE;
+	}
+
+	/* wait 15 s before reopening port */
+	fu_device_sleep(device, 15000);
+
+	locker = fu_device_locker_new_full(self,
+					   (FuDeviceLockerFunc)fu_mm_device_cinterion_fdl_open,
+					   (FuDeviceLockerFunc)fu_mm_device_cinterion_fdl_close,
+					   error);
+	if (locker == NULL)
+		return FALSE;
+
+	return fu_cinterion_fdl_updater_wait_ready(self->cinterion_fdl_updater, device, error);
+}
+
+static gboolean
 fu_mm_device_detach_fastboot(FuDevice *device, GError **error)
 {
 	FuMmDevice *self = FU_MM_DEVICE(device);
@@ -894,6 +972,8 @@ fu_mm_device_detach(FuDevice *device, FuProgress *progress, GError **error)
 		/* fastboot */
 		if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_FASTBOOT)
 			return fu_mm_device_detach_fastboot(device, error);
+		if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_CINTERION_FDL)
+			return fu_mm_device_detach_fdl(device, progress, error);
 		/* otherwise, assume we don't need any detach */
 		return TRUE;
 	}
@@ -1628,6 +1708,28 @@ fu_mm_device_write_firmware_firehose(FuDevice *device,
 }
 
 static gboolean
+fu_mm_device_write_firmware_fdl(FuDevice *device, GBytes *fw, FuProgress *progress, GError **error)
+{
+	FuMmDevice *self = FU_MM_DEVICE(device);
+	g_autoptr(FuDeviceLocker) locker = NULL;
+
+	locker = fu_device_locker_new_full(device,
+					   (FuDeviceLockerFunc)fu_mm_device_cinterion_fdl_open,
+					   (FuDeviceLockerFunc)fu_mm_device_cinterion_fdl_close,
+					   error);
+	if (locker == NULL)
+		return FALSE;
+
+	fu_progress_set_status(progress, FWUPD_STATUS_DEVICE_WRITE);
+
+	return fu_cinterion_fdl_updater_write(self->cinterion_fdl_updater,
+					      progress,
+					      device,
+					      fw,
+					      error);
+}
+
+static gboolean
 fu_mm_device_write_firmware(FuDevice *device,
 			    FuFirmware *firmware,
 			    FuProgress *progress,
@@ -1662,6 +1764,9 @@ fu_mm_device_write_firmware(FuDevice *device,
 	/* firehose operation */
 	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_FIREHOSE)
 		return fu_mm_device_write_firmware_firehose(device, fw, progress, error);
+
+	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_CINTERION_FDL)
+		return fu_mm_device_write_firmware_fdl(device, fw, progress, error);
 
 	g_set_error(error, FWUPD_ERROR, FWUPD_ERROR_NOT_SUPPORTED, "unsupported update method");
 	return FALSE;

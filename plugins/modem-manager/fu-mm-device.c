@@ -209,10 +209,15 @@ fu_mm_device_probe_default(FuDevice *device, GError **error)
 	FuMmDevice *self = FU_MM_DEVICE(device);
 	MMModemFirmware *modem_fw;
 	MMModem *modem = mm_object_peek_modem(self->omodem);
-	MMModemPortInfo *ports = NULL;
+	g_autoptr(GArray) ports = NULL;
+	MMModemPortInfo *used_ports = NULL;
+#if MM_CHECK_VERSION(1, 24, 0)
+	MMModemPortInfo *ignored_ports = NULL;
+#endif // MM_CHECK_VERSION(1, 24, 0)
 	const gchar **device_ids;
 	const gchar *version;
-	guint n_ports = 0;
+	guint n_used_ports = 0;
+	guint n_ignored_ports = 0;
 	g_autoptr(MMFirmwareUpdateSettings) update_settings = NULL;
 	const gchar *sysfs_path;
 
@@ -271,7 +276,7 @@ fu_mm_device_probe_default(FuDevice *device, GError **error)
 	}
 
 	/* look for the AT and QMI/MBIM ports */
-	if (!mm_modem_get_ports(modem, &ports, &n_ports)) {
+	if (!mm_modem_get_ports(modem, &used_ports, &n_used_ports)) {
 		g_set_error_literal(error,
 				    FWUPD_ERROR,
 				    FWUPD_ERROR_NOT_SUPPORTED,
@@ -279,19 +284,40 @@ fu_mm_device_probe_default(FuDevice *device, GError **error)
 		return FALSE;
 	}
 #if MM_CHECK_VERSION(1, 24, 0)
+	if (!mm_modem_get_ignored_ports(modem, &ignored_ports, &n_ignored_ports)) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_NOT_SUPPORTED,
+				    "failed to get ignored port information");
+		return FALSE;
+	}
+#endif // MM_CHECK_VERSION(1, 24, 0)
+
+	ports = g_array_sized_new(FALSE,
+				  FALSE,
+				  sizeof(MMModemPortInfo),
+				  n_used_ports + n_ignored_ports);
+	g_array_append_vals(ports, used_ports, n_used_ports);
+#if MM_CHECK_VERSION(1, 24, 0)
+	g_array_append_vals(ports, ignored_ports, n_ignored_ports);
+#endif // MM_CHECK_VERSION(1, 24, 0)
+
+#if MM_CHECK_VERSION(1, 24, 0)
 	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_CINTERION_FDL) {
-		for (guint i = 0; i < n_ports; i++) {
-			if (ports[i].type == MM_MODEM_PORT_TYPE_AT) {
-				self->port_at = g_strdup_printf("/dev/%s", ports[i].name);
+		for (guint i = 0; i < ports->len; i++) {
+			MMModemPortInfo port = g_array_index(ports, MMModemPortInfo, i);
+			if (port.type == MM_MODEM_PORT_TYPE_AT) {
+				self->port_at = g_strdup_printf("/dev/%s", port.name);
 				break;
 			}
 		}
 		fu_device_add_protocol(device, "com.cinterion.fdl");
 	}
 	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_DFOTA) {
-		for (guint i = 0; i < n_ports; i++) {
-			if (ports[i].type == MM_MODEM_PORT_TYPE_AT) {
-				self->port_at = g_strdup_printf("/dev/%s", ports[i].name);
+		for (guint i = 0; i < ports->len; i++) {
+			MMModemPortInfo port = g_array_index(ports, MMModemPortInfo, i);
+			if (port.type == MM_MODEM_PORT_TYPE_AT) {
+				self->port_at = g_strdup_printf("/dev/%s", port.name);
 				break;
 			}
 		}
@@ -299,19 +325,21 @@ fu_mm_device_probe_default(FuDevice *device, GError **error)
 	}
 #endif // MM_CHECK_VERSION(1, 24, 0)
 	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_FASTBOOT) {
-		for (guint i = 0; i < n_ports; i++) {
-			if (ports[i].type == MM_MODEM_PORT_TYPE_AT) {
-				self->port_at = g_strdup_printf("/dev/%s", ports[i].name);
+		for (guint i = 0; i < ports->len; i++) {
+			MMModemPortInfo port = g_array_index(ports, MMModemPortInfo, i);
+			if (port.type == MM_MODEM_PORT_TYPE_AT) {
+				self->port_at = g_strdup_printf("/dev/%s", port.name);
 				break;
 			}
 		}
 		fu_device_add_protocol(device, "com.google.fastboot");
 	}
 	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_QMI_PDC) {
-		for (guint i = 0; i < n_ports; i++) {
-			if ((ports[i].type == MM_MODEM_PORT_TYPE_QMI) ||
-			    (ports[i].type == MM_MODEM_PORT_TYPE_MBIM)) {
-				self->port_qmi = g_strdup_printf("/dev/%s", ports[i].name);
+		for (guint i = 0; i < ports->len; i++) {
+			MMModemPortInfo port = g_array_index(ports, MMModemPortInfo, i);
+			if ((port.type == MM_MODEM_PORT_TYPE_QMI) ||
+			    (port.type == MM_MODEM_PORT_TYPE_MBIM)) {
+				self->port_qmi = g_strdup_printf("/dev/%s", port.name);
 				break;
 			}
 		}
@@ -320,30 +348,37 @@ fu_mm_device_probe_default(FuDevice *device, GError **error)
 			fu_device_add_protocol(device, "com.qualcomm.qmi_pdc");
 	}
 	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_MBIM_QDU) {
-		for (guint i = 0; i < n_ports; i++) {
-			if (ports[i].type == MM_MODEM_PORT_TYPE_MBIM) {
-				self->port_mbim = g_strdup_printf("/dev/%s", ports[i].name);
+		for (guint i = 0; i < ports->len; i++) {
+			MMModemPortInfo port = g_array_index(ports, MMModemPortInfo, i);
+			if (port.type == MM_MODEM_PORT_TYPE_MBIM) {
+				self->port_mbim = g_strdup_printf("/dev/%s", port.name);
 				break;
 			}
 		}
 		fu_device_add_protocol(device, "com.qualcomm.mbim_qdu");
 	}
 	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_FIREHOSE) {
-		for (guint i = 0; i < n_ports; i++) {
-			if ((ports[i].type == MM_MODEM_PORT_TYPE_QCDM) ||
-			    (ports[i].type == MM_MODEM_PORT_TYPE_IGNORED &&
-			     g_strstr_len(ports[i].name, -1, "qcdm") != NULL))
-				self->port_qcdm = g_strdup_printf("/dev/%s", ports[i].name);
-			else if (ports[i].type == MM_MODEM_PORT_TYPE_MBIM)
-				self->port_mbim = g_strdup_printf("/dev/%s", ports[i].name);
+		for (guint i = 0; i < ports->len; i++) {
+			MMModemPortInfo port = g_array_index(ports, MMModemPortInfo, i);
+			/* workaround using port name matching on ignored ports
+			 * may be removed for ModemManager versions >= 1.24.0 */
+			if ((port.type == MM_MODEM_PORT_TYPE_QCDM) ||
+			    (port.type == MM_MODEM_PORT_TYPE_IGNORED &&
+			     g_strstr_len(port.name, -1, "qcdm") != NULL))
+				self->port_qcdm = g_strdup_printf("/dev/%s", port.name);
+			else if (port.type == MM_MODEM_PORT_TYPE_MBIM)
+				self->port_mbim = g_strdup_printf("/dev/%s", port.name);
 			/* to read secboot status */
-			else if (ports[i].type == MM_MODEM_PORT_TYPE_AT)
-				self->port_at = g_strdup_printf("/dev/%s", ports[i].name);
+			else if (port.type == MM_MODEM_PORT_TYPE_AT)
+				self->port_at = g_strdup_printf("/dev/%s", port.name);
 		}
 		fu_device_add_protocol(device, "com.qualcomm.firehose");
 	}
 
-	mm_modem_port_info_array_free(ports, n_ports);
+	mm_modem_port_info_array_free(used_ports, n_used_ports);
+#if MM_CHECK_VERSION(1, 24, 0)
+	mm_modem_port_info_array_free(ignored_ports, n_ignored_ports);
+#endif // MM_CHECK_VERSION(1, 24, 0)
 
 	/* an at port is required for fastboot */
 	if ((self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_FASTBOOT) &&

@@ -16,6 +16,7 @@ plugin_quirks += files('modem-manager.quirk')
 shared_module('fu_plugin_modem_manager',
   rustgen.process(
     'fu-mm-fdl.rs',
+    'fu-mm-qcdm-device.rs',
   ),
   sources: [
     'fu-mm-backend.c',

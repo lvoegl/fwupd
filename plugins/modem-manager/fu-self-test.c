@@ -8,6 +8,7 @@
 
 #include "fu-context-private.h"
 #include "fu-mm-device.h"
+#include "fu-mm-qcdm-device-struct.h"
 
 static void
 fu_mm_device_func(void)
@@ -82,10 +83,37 @@ fu_mm_device_func(void)
 	    FU_DEVICE_INSTANCE_FLAG_VISIBLE | FU_DEVICE_INSTANCE_FLAG_QUIRKS));
 }
 
+static void
+fu_mm_qcdm_command_dump(void)
+{
+	const guint8 expected[] = {0x4B, 0x65, 0x01, 0x00, 0x54, 0x0F};
+	g_autoptr(FuMmQcdmDeviceBasePacket) pkt = fu_mm_qcdm_device_base_packet_new();
+	g_autoptr(FuMmQcdmDevicePacketData) data = fu_mm_qcdm_device_packet_data_new();
+	g_autoptr(GBytes) encoded_pkt = NULL;
+	g_autoptr(GError) error = NULL;
+	gboolean ret;
+
+	fu_mm_qcdm_device_packet_data_set_command(data, FU_MM_QCDM_DEVICE_COMMAND_SUBSYSTEM);
+	fu_mm_qcdm_device_packet_data_set_subsystem(data, FU_MM_QCDM_DEVICE_SUBSYSTEM_OPERATIONS);
+	fu_mm_qcdm_device_packet_data_set_subsystem_command(
+	    data,
+	    FU_MM_QCDM_DEVICE_SUBSYSTEM_COMMAND_REBOOT_EDL);
+
+	fu_mm_qcdm_device_base_packet_set_crc(
+	    pkt,
+	    fu_crc16(FU_CRC_KIND_B16_ISO_HDLC, data->data, data->len));
+	ret = fu_mm_qcdm_device_base_packet_set_data(pkt, data, &error);
+	g_assert_true(ret);
+	g_assert_no_error(error);
+
+	g_assert_cmpmem(pkt->data, pkt->len, expected, sizeof(expected));
+}
+
 int
 main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/mm/device", fu_mm_device_func);
+	g_test_add_func("/mm/qcdm-command{dump}", fu_mm_qcdm_command_dump);
 	return g_test_run();
 }

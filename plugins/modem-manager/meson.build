@@ -18,6 +18,7 @@ plugin_quirks += files('modem-manager.quirk')
 shared_module('fu_plugin_modem_manager',
   rustgen.process(
     'fu-mm-fdl.rs',
+    'fu-mm-qcdm-device.rs',
   ),
   sources: [
     'fu-mm-backend.c',
@@ -59,10 +60,12 @@ enumeration_data += files(
 if get_option('tests')
   e = executable(
     'modem-manager-self-test',
+    rustgen.process('fu-mm-qcdm-device.rs'),
     sources: [
       'fu-self-test.c',
       'fu-mm-common.c',
       'fu-mm-device.c',
+      'fu-mm-qcdm-device.c',
     ],
     include_directories: plugin_incdirs,
     dependencies: [
